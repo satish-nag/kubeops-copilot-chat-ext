@@ -12,18 +12,25 @@ import {
     findGatewaysReferencedByVirtualService,
     findWorkloadsBackedByService
 } from "./reverseLookup";
+import { ImpactAction } from "./impactAnalyzer";
 
-export async function analyzeConfigMapImpact(
-    kc: k8s.KubeConfig,
-    target: any
-) {
+type ImpactContext = {
+    action: ImpactAction;
+    changeSummary?: string;
+    target: { kind: string; name: string; namespace?: string };
+};
+
+export async function analyzeConfigMapImpact(kc: k8s.KubeConfig, ctx: ImpactContext) {
+    const { action, changeSummary, target } = ctx;
     const consumers = await findWorkloadsReferencing(kc, {
         kind: "ConfigMap",
         name: target.name,
-        namespace: target.namespace
+        namespace: target.namespace ?? 'default'
     });
 
     return {
+        action,
+        changeSummary,
         target,
         severity: consumers.length ? "MEDIUM" : "NONE" as ImpactSeverity,
         summary: consumers.length
@@ -39,17 +46,18 @@ export async function analyzeConfigMapImpact(
     };
 }
 
-export async function analyzeSecretImpact(
-    kc: k8s.KubeConfig,
-    target: any
-) {
+export async function analyzeSecretImpact(kc: k8s.KubeConfig, ctx: ImpactContext) {
+    const { action, changeSummary, target } = ctx;
+
     const consumers = await findWorkloadsReferencing(kc, {
         kind: "Secret",
         name: target.name,
-        namespace: target.namespace
+        namespace: target.namespace ?? 'default'
     });
 
     return {
+        action,
+        changeSummary,
         target,
         severity: consumers.length ? "HIGH" : "NONE" as ImpactSeverity,
         summary: consumers.length
@@ -65,11 +73,11 @@ export async function analyzeSecretImpact(
     };
 }
 
-export async function analyzePVCImpact(
-    kc: k8s.KubeConfig,
-    target: any
-): Promise<ImpactResult> {
+export async function analyzePVCImpact(kc: k8s.KubeConfig, ctx: ImpactContext): Promise<ImpactResult> {
+    const { action, changeSummary, target } = ctx;
     return {
+        action,
+        changeSummary,
         target,
         severity: "HIGH" as ImpactSeverity,
         summary: "Pods using this PVC will fail to start or lose storage access.",
@@ -77,7 +85,7 @@ export async function analyzePVCImpact(
             {
                 kind: "Pod",
                 name: "*",
-                namespace: target.namespace,
+                namespace: target.namespace ?? 'default',
                 impactType: "StorageUnavailable",
                 severity: "HIGH" as ImpactSeverity
             }
@@ -85,11 +93,12 @@ export async function analyzePVCImpact(
     };
 }
 
-export async function analyzePVImpact(
-    kc: k8s.KubeConfig,
-    target: any
-): Promise<ImpactResult> {
+export async function analyzePVImpact(kc: k8s.KubeConfig, ctx: ImpactContext): Promise<ImpactResult> {
+    const { action, changeSummary, target } = ctx;
+
     return {
+        action,
+        changeSummary,
         target,
         severity: "HIGH" as ImpactSeverity,
         summary: "Deleting this PV breaks the bound PVC and all consuming pods.",
@@ -104,7 +113,8 @@ export async function analyzePVImpact(
     };
 }
 
-export async function analyzeServiceImpact(kc: k8s.KubeConfig, target: any) {
+export async function analyzeServiceImpact(kc: k8s.KubeConfig, ctx: ImpactContext) {
+    const { action, changeSummary, target } = ctx;
     const ns = target.namespace!;
     const name = target.name;
 
@@ -147,18 +157,24 @@ export async function analyzeServiceImpact(kc: k8s.KubeConfig, target: any) {
                 : ("LOW" as ImpactSeverity);
 
     return {
+        action,
+        changeSummary,
         target,
         severity,
-        summary: (ing.length + vs.length) > 0
-            ? "Deleting this Service will break routing rules (Ingress/VirtualService) and stop traffic from reaching the workloads behind the Service selector."
-            : backedWorkloads.length > 0
-                ? "Deleting this Service will stop in-cluster traffic from reaching the workloads behind its selector."
-                : "No Ingress/VirtualService routes found and no selector-backed workloads detected for this Service.",
+        summary:
+            action === "delete"
+                ? (impacted.length
+                    ? "Deleting this Service will break routing rules (Ingress/VirtualService) and stop traffic from reaching workloads behind the Service selector."
+                    : "Deleting this Service removes the stable service endpoint; no Ingress/VirtualService routes found and no selector-backed workloads detected.")
+                : (changeSummary
+                    ? `Updating this Service (${changeSummary}) may change which pods receive traffic (selector/ports). Routing rules remain, but traffic distribution could change.`
+                    : "Updating this Service may change which pods receive traffic (selector/ports). Routing rules remain, but traffic distribution could change."),
         impactedResources: impacted
     };
 }
 
-export async function analyzeIngressImpact(kc: k8s.KubeConfig, target: any) {
+export async function analyzeIngressImpact(kc: k8s.KubeConfig, ctx: ImpactContext) {
+    const { action, changeSummary, target } = ctx;
     const ns = target.namespace!;
     const name = target.name;
 
@@ -176,16 +192,22 @@ export async function analyzeIngressImpact(kc: k8s.KubeConfig, target: any) {
     const severity: ImpactSeverity = ("HIGH" as ImpactSeverity);
 
     return {
+        action,
+        changeSummary,
         target,
         severity,
-        summary: svcs.length
-            ? "Deleting this Ingress will remove external HTTP(S) routing to its backend services."
-            : "Deleting this Ingress will remove external routing; no explicit backend services were found in rules.",
+        summary:
+            action === "delete"
+                ? "Deleting this Ingress will remove external HTTP(S) routing to its backend services."
+                : (changeSummary
+                    ? `Updating this Ingress (${changeSummary}) will change external routing behavior to backend services.`
+                    : "Updating this Ingress will change external routing behavior to backend services."),
         impactedResources: impacted
     };
 }
 
-export async function analyzeVirtualServiceImpact(kc: k8s.KubeConfig, target: any) {
+export async function analyzeVirtualServiceImpact(kc: k8s.KubeConfig, ctx: ImpactContext) {
+    const { action, changeSummary, target } = ctx;
     const ns = target.namespace!;
     const name = target.name;
 
@@ -212,15 +234,22 @@ export async function analyzeVirtualServiceImpact(kc: k8s.KubeConfig, target: an
     const severity: ImpactSeverity = ("CRITICAL" as ImpactSeverity);
 
     return {
+        action,
+        changeSummary,
         target,
         severity,
         summary:
-            "Deleting this VirtualService will remove routing rules, potentially causing traffic to stop reaching destination services via referenced gateways.",
+            action === "delete"
+                ? "Deleting this VirtualService will remove routing rules, and traffic may stop reaching destination services via the referenced gateways."
+                : (changeSummary
+                    ? `Updating this VirtualService (${changeSummary}) changes traffic routing behavior (e.g., weights/matches). No resources are deleted; only routing distribution changes.`
+                    : "Updating this VirtualService changes traffic routing behavior (e.g., weights/matches). No resources are deleted; only routing distribution changes."),
         impactedResources: impacted
     };
 }
 
-export async function analyzeGatewayImpact(kc: k8s.KubeConfig, target: any) {
+export async function analyzeGatewayImpact(kc: k8s.KubeConfig, ctx: ImpactContext) {
+    const { action, changeSummary, target } = ctx;
     const ns = target.namespace!;
     const name = target.name;
 
@@ -238,11 +267,18 @@ export async function analyzeGatewayImpact(kc: k8s.KubeConfig, target: any) {
     const severity: ImpactSeverity = impacted.length ? ("CRITICAL" as ImpactSeverity) : ("HIGH" as ImpactSeverity);
 
     return {
+        action,
+        changeSummary,
         target,
         severity,
-        summary: impacted.length
-            ? "Deleting this Gateway will break ingress traffic handled by VirtualServices that reference it."
-            : "Deleting this Gateway will remove an ingress listener; no VirtualServices in the same namespace explicitly reference it.",
+        summary:
+            action === "delete"
+                ? (impacted.length
+                    ? "Deleting this Gateway will break ingress traffic handled by VirtualServices that reference it."
+                    : "Deleting this Gateway will remove an ingress listener; no VirtualServices in the same namespace explicitly reference it.")
+                : (changeSummary
+                    ? `Updating this Gateway (${changeSummary}) may alter listeners/hosts/tls settings and change which traffic is accepted.`
+                    : "Updating this Gateway may alter listeners/hosts/tls settings and change which traffic is accepted."),
         impactedResources: impacted
     };
 }

@@ -310,11 +310,13 @@ async function chatRequestHandler(
           type: "object",
           additionalProperties: false,
           properties: {
+            action: { type: "string", enum: ["delete", "update"] },
             kind: { type: "string" },
             name: { type: "string" },
-            namespace: { type: "string" }
+            namespace: { type: "string" },
+            changeSummary: { type: "string" }
           },
-          required: ["kind", "name"]
+          required: ["action", "kind", "name"]
         }
       }
     ]
@@ -480,6 +482,12 @@ Rules:
 - If user asks "impact of deleting", "what breaks if removed", or "impact analysis", call analyzeImpact.
 - Do NOT call delete tools.
 
+IMPACT TOOL ACTION RULES:
+- If user asks about deleting/removing a resource, call analyzeImpact with action="delete".
+- If user asks about updating/changing/patching/shifting traffic/weights, call analyzeImpact with action="update".
+- For update requests, include changeSummary (short phrase) that captures what is being changed (e.g., "shift traffic v1=90%, v2=9%").
+- Never talk about delete impact when action="update".
+
 JSON format:
 {
   "summary": string,
@@ -539,9 +547,12 @@ STRICT rules:
 
 IMPACT ANALYSIS EXTENSION:
 - If tool results include analyzeImpact:
-  - Treat analyzeImpact.result as the authoritative source of truth.
+  - Use analyzeImpact.result.action to decide whether to describe delete vs update.
+  - If action="update", do NOT mention deletion.
+  - If action="delete", focus on deletion.
   - Render a dedicated section titled "Impact Analysis".
-  - Start with a concise 2-3 sentence summary describing what happens if the target resource is deleted.
+  - Start with a concise 2-3 sentence summary describing what happens if the target resource is deleted or updated based on user context.
+  - if user asked specifically about impact of deleting/updating the resource, focus the summary on that aspect.
   - Render a Markdown table listing ALL impacted resources exactly as provided in analyzeImpact.result.impactedResources.
   - The table MUST include columns: Kind, Name, Namespace, Impact Type, Severity.
   - Do NOT infer, discover, or add any additional impacted resources.
