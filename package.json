@@ -1,0 +1,49 @@
+{
+  "name": "kubeops-copilot-chat-ext",
+  "displayName": "KubeOps (Copilot Chat)",
+  "description": "A GitHub Copilot Chat participant (agent scaffold).",
+  "version": "0.0.1",
+  "publisher": "local",
+  "extensionDependencies": [
+    "GitHub.copilot-chat"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "engines": {
+    "vscode": ">=1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "activationEvents": [
+    "onChatParticipant:kubecopilot.kubeops"
+  ],
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "kubecopilot.kubeops",
+        "name": "kubeops",
+        "fullName": "KubeOps",
+        "description": "Agent-style Kubernetes assistant (rebuilding).",
+        "isSticky": true
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -w -p ."
+  },
+  "dependencies": {
+    "@kubernetes/client-node": "^0.22.3",
+     "yaml": "^2.4.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.96.0",
+    "typescript": "^5.6.3"
+  }
+}
