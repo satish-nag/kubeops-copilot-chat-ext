@@ -36,6 +36,7 @@ Key internal functions (high level):
 - `createResource(...)`: creates one object from LM-provided values / yaml.
 - `patchResource(...)`: patches one object using **server-side apply**.
 - `analyzeImpact(...)`: computes delete-impact severity and dependencies.
+- `analyzeTrafficFlow(...)`: discovers traffic graph paths and returns Mermaid.
 
 Support functions:
 
@@ -46,6 +47,7 @@ Support functions:
 - Manifest shaping: `buildWriteManifest`, `normalizeValuesForKind`, `parseSingleManifestYaml`
 - Output shaping: `sanitizeManifest`, `extractReferencedResources`
 - Error formatting: `asErrorMessage`, `formatKubernetesHttpError`, `extractKubernetesStatusMessage`, `kubeHttpErrorDetails`
+- Write approvals: `previewCreate`, `previewPatch`, `diffForPreview`, `renderWriteApprovalMarkdown`
 
 ---
 
@@ -119,6 +121,7 @@ The handler constructs a JSON object describing available tools:
 - `createResource`
 - `patchResource`
 - `analyzeImpact`
+- `analyzeTrafficFlow`
 
 Each tool entry includes:
 
@@ -185,7 +188,7 @@ Important limitation:
 
 The plan contains `toolCalls`, each with:
 
-- `tool`: `"getResource" | "createResource" | "patchResource" | "analyzeImpact"`
+- `tool`: `"getResource" | "createResource" | "patchResource" | "analyzeImpact" | "analyzeTrafficFlow"`
 - `args`: the tool-specific argument object
 
 The handler calls:
@@ -295,7 +298,7 @@ Referenced resources extraction walks common fields like:
 
 ## 7) Tool: `createResource` (create one object)
 
-Note: This is a write operation and requires explicit user approval. See [Section 14](#14-write-approval-gate-create--patch).
+Note: This is a write operation and requires explicit user approval. See [Section 13](#13-write-approval-gate-create--patch).
 
 ### 7.1 Build a manifest from args
 
@@ -334,7 +337,7 @@ It returns:
 
 ## 8) Tool: `patchResource` (patch/update one object)
 
-Note: This is a write operation and requires explicit user approval. See [Section 14](#14-write-approval-gate-create--patch).
+Note: This is a write operation and requires explicit user approval. See [Section 13](#13-write-approval-gate-create--patch).
 
 This tool uses **server-side apply** via `KubernetesObjectApi.patch(...)` with:
 
@@ -359,13 +362,15 @@ Important implication:
 
 ## 9) Tool: `analyzeImpact` (delete-impact analysis)
 
-This tool analyzes **what would be affected if a resource were deleted**. It does not change cluster state.
+This tool analyzes what would be affected by either a **delete** or an **update** request. It does not change cluster state.
 
 High-level behavior:
 
 - Dispatches by kind to resource-specific rules (e.g., ConfigMap, Secret, Service, Ingress, VirtualService, Gateway).
 - Uses reverse lookup helpers to discover dependent workloads or routing objects.
 - Produces:
+  - action (`delete` or `update`)
+  - optional `changeSummary` for update scenarios
   - overall severity
   - a short summary
   - a list of impacted resources (kind/name/namespace/refType/severity)
@@ -564,3 +569,28 @@ In one sentence:
 `extension.ts` runs a “plan → execute → report” loop where the model outputs strict JSON tool calls, the extension runs them against Kubernetes, and the model then writes a Markdown report using only the tool results.
 
 ---
+
+## 15) Traffic flow analyzer (`src/analyzer/traffic*`)
+
+`analyzeTrafficFlow` builds a directed traffic graph and Mermaid diagram from a starting object.
+
+Implemented behavior:
+
+- Supported start kinds today: `Service`, `Pod`, `Ingress`, `VirtualService` (others return warnings).
+- Namespace defaults from kube context when omitted.
+- `includeIstio` defaults to true and enables VirtualService/Gateway/DestinationRule discovery.
+- Output includes:
+  - `nodes[]` (typed traffic nodes)
+  - `edges[]` with human-readable `reason`
+  - optional `warnings[]`
+  - `mermaid` graph text (`graph LR`)
+
+Analyzer package structure:
+
+- `src/analyzer/trafficFlowAnalyzer.ts`: entrypoint + start object existence checks.
+- `src/analyzer/traffic/router.ts`: dispatch by start kind.
+- `src/analyzer/traffic/discover/*.ts`: discovery logic per source kind.
+- `src/analyzer/traffic/k8s.ts`: Kubernetes/Istio API helpers (including EndpointSlice lookup fallback).
+- `src/analyzer/traffic/graph.ts`: graph builder + edge de-dup.
+- `src/analyzer/traffic/mermaid.ts`: graph-to-Mermaid rendering.
+- `src/analyzer/traffic/types.ts`: args/result graph types.
