@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as k8s from "@kubernetes/client-node";
 import { analyzeImpact } from "./analyzer/impactAnalyzer";
+import { analyzeTrafficFlow } from "./analyzer/trafficFlowAnalyzer";
 
 // IMPORTANT: must match contributes.chatParticipants[id] in package.json
 const PARTICIPANT_ID = "kubecopilot.kubeops";
@@ -109,7 +110,8 @@ type KubeSession = {
 type ToolCall =
   | { tool: "getResource"; args: GetResourceArgs }
   | { tool: "createResource"; args: CreateOrPatchResourceArgs }
-  | { tool: "patchResource"; args: PatchResourceArgs };
+  | { tool: "patchResource"; args: PatchResourceArgs }
+  | { tool: "analyzeTrafficFlow"; args: { kind: string; name: string; namespace?: string; maxDepth?: number; includeIstio?: boolean } };;
 
 // JSON tool plan structure returned by the planner ( LLM )
 type JsonToolPlan = {
@@ -318,6 +320,23 @@ async function chatRequestHandler(
           },
           required: ["action", "kind", "name"]
         }
+      },
+      {
+        name: "analyzeTrafficFlow",
+        description:
+          "Discover upstream and downstream traffic-related Kubernetes/Istio objects for a given starting object and return a directed graph plus Mermaid output.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            kind: { type: "string" },
+            name: { type: "string" },
+            namespace: { type: "string" },
+            maxDepth: { type: "number" },
+            includeIstio: { type: "boolean" }
+          },
+          required: ["kind", "name"]
+        }
       }
     ]
   };
@@ -447,6 +466,13 @@ async function executeToolCalls(
       } catch (e) {
         results.push({ tool, args, result: { error: asErrorMessage(e) } });
       }
+    } else if (tool === "analyzeTrafficFlow") {
+      try {
+        const res = await analyzeTrafficFlow(session.kubeConfig, args as any);
+        results.push({ tool, args, result: res });
+      } catch (e) {
+        results.push({ tool, args, result: { error: asErrorMessage(e) } });
+      }
     }
     else if (tool) {
       results.push({ tool: String(tool), args, result: { error: "Unknown tool" } });
@@ -480,6 +506,7 @@ Rules:
 - Only set done=true if the intent is ambiguous or the target resource cannot be determined.
 - If required inputs are missing (kind or name), do not call tools. Set done=true and explain what is missing in summary.
 - If user asks "impact of deleting", "what breaks if removed", or "impact analysis", call analyzeImpact.
+- If user asks for "traffic flow", "upstream/downstream", "how traffic reaches", or "request path", call analyzeTrafficFlow.
 - Do NOT call delete tools.
 
 IMPACT TOOL ACTION RULES:
@@ -500,7 +527,7 @@ JSON format:
 }
 
 Supported kinds:
-Kubernetes: Namespace, Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, IngressClass, NetworkPolicy, EndpointSlice, ConfigMap, Secret, PersistentVolume, PersistentVolumeClaim, StorageClass, ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, HorizontalPodAutoscaler, PodDisruptionBudget, PriorityClass, Node, Event
+Kubernetes: Namespace, Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, IngressClass, NetworkPolicy, EndpointSlice, Endpoints, ConfigMap, Secret, PersistentVolume, PersistentVolumeClaim, StorageClass, ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, HorizontalPodAutoscaler, PodDisruptionBudget, PriorityClass, Node, Event
 Istio: VirtualService, DestinationRule, Gateway, PeerAuthentication, AuthorizationPolicy, ServiceEntry
 
 Notes:
@@ -558,6 +585,14 @@ IMPACT ANALYSIS EXTENSION:
   - Do NOT infer, discover, or add any additional impacted resources.
   - If impactedResources is empty, explicitly state: "No resources are impacted."
   - This section is independent of manifest-based reporting rules.
+TRAFFIC FLOW EXTENSION:
+- If tool results include analyzeTrafficFlow:
+  - Render a dedicated section titled "Traffic Flow".
+  - Start with a 2-3 sentence summary of the request path in plain English.
+  - Include the Mermaid graph exactly as returned in analyzeTrafficFlow.result.mermaid in a \`\`\`mermaid code block.
+  - Render a Markdown table of edges with columns: From, To, Reason.
+  - Do NOT invent nodes/edges; only use returned nodes/edges.
+  - If edges is empty, state: "No traffic edges discovered from available data.".
 
 Output format guidelines:
 - Start with a 2-3 line summary.
