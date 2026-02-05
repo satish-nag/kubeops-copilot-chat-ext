@@ -37,6 +37,7 @@ Key internal functions (high level):
 - `patchResource(...)`: patches one object using **server-side apply**.
 - `analyzeImpact(...)`: computes delete-impact severity and dependencies.
 - `analyzeTrafficFlow(...)`: discovers traffic graph paths and returns Mermaid.
+- `investigatePodHealth(...)`: investigates Pod/Deployment health with events/log evidence.
 
 Support functions:
 
@@ -122,6 +123,7 @@ The handler constructs a JSON object describing available tools:
 - `patchResource`
 - `analyzeImpact`
 - `analyzeTrafficFlow`
+- `investigatePodHealth`
 
 Each tool entry includes:
 
@@ -188,7 +190,7 @@ Important limitation:
 
 The plan contains `toolCalls`, each with:
 
-- `tool`: `"getResource" | "createResource" | "patchResource" | "analyzeImpact" | "analyzeTrafficFlow"`
+- `tool`: `"getResource" | "createResource" | "patchResource" | "analyzeImpact" | "analyzeTrafficFlow" | "investigatePodHealth"`
 - `args`: the tool-specific argument object
 
 The handler calls:
@@ -570,9 +572,9 @@ In one sentence:
 
 ---
 
-## 15) Traffic flow analyzer (`src/analyzer/traffic*`)
+## 15) Tool: `analyzeTrafficFlow` (traffic graph + Mermaid)
 
-`analyzeTrafficFlow` builds a directed traffic graph and Mermaid diagram from a starting object.
+`analyzeTrafficFlow` builds a directed traffic graph and Mermaid diagram from a starting object. It is designed to answer questions like “how does traffic reach X” or “what’s upstream/downstream of this Service/Pod/Ingress/VirtualService”.
 
 Implemented behavior:
 
@@ -585,6 +587,17 @@ Implemented behavior:
   - optional `warnings[]`
   - `mermaid` graph text (`graph LR`)
 
+Discovery highlights:
+
+- **Downstream (Service)**: `Service -> EndpointSlice -> Pod` via `kubernetes.io/service-name` label + `endpoints[].targetRef`.
+- **Upstream (Ingress)**: `Ingress -> Service` by scanning ingress backends.
+- **Istio routing** (when `includeIstio=true`):
+  - `Gateway -> VirtualService` (gateway referenced by VS)
+  - `VirtualService -> DestinationRule -> Service` when a matching DestinationRule host is found
+  - else `VirtualService -> Service` directly via destination hosts
+- **NetworkPolicy evidence (best-effort)**:
+  - When discovering pods behind a Service, the analyzer may attach `NetworkPolicy -> Pod` edges to show policies selecting the destination pod and whether ingress could be blocked (limited evaluation).
+
 Analyzer package structure:
 
 - `src/analyzer/trafficFlowAnalyzer.ts`: entrypoint + start object existence checks.
@@ -594,3 +607,25 @@ Analyzer package structure:
 - `src/analyzer/traffic/graph.ts`: graph builder + edge de-dup.
 - `src/analyzer/traffic/mermaid.ts`: graph-to-Mermaid rendering.
 - `src/analyzer/traffic/types.ts`: args/result graph types.
+
+---
+
+## 16) Tool: `investigatePodHealth` (pod/deployment health investigation)
+
+`investigatePodHealth` collects structured evidence to explain why a Pod (or pods under a Deployment) are unhealthy.
+
+Supported start kinds:
+
+- `Pod`: investigates that single Pod
+- `Deployment`: lists pods for the deployment selector and inspects up to `maxPods` (preferring “worst” pods: not-ready, then bad phase, then restarts)
+
+Evidence gathered (best-effort):
+
+- Pod phase, readiness, restarts, node
+- Pod conditions and container states (waiting/terminated reasons)
+- Recent Events (newest first)
+- Recent container logs (per container, tail + sinceSeconds)
+- Probe summaries (readiness/liveness/startup)
+- Service/Endpoint evidence: which Services select the pod, and whether it appears in EndpointSlices
+- PVC and Node condition hints
+- NetworkPolicies selecting the pod (matchLabels-only, bounded list)

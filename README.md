@@ -18,6 +18,7 @@ The extension implements an agentic, tool-calling flow that can:
 - Patch/update a single object via server-side apply (`patchResource`)
 - Analyze impact for delete/update operations (`analyzeImpact`)
 - Discover traffic paths and render Mermaid graphs (`analyzeTrafficFlow`)
+- Investigate unhealthy Pods/Deployments with evidence (`investigatePodHealth`)
 
 Write operations support common Kubernetes resources (Pod, Deployment, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, NetworkPolicy, ConfigMap, Secret) and Istio objects supported by `getResource` (VirtualService, DestinationRule, Gateway, PeerAuthentication, AuthorizationPolicy, ServiceEntry).
 
@@ -58,6 +59,19 @@ The `analyzeTrafficFlow` tool discovers upstream/downstream relationships and re
 
 Current supported start kinds: `Service`, `Pod`, `Ingress`, `VirtualService`.
 
+It also attempts to attach network-policy evidence to destination pods (best-effort) when discovering flows from Services.
+
+### Pod health investigation
+
+The `investigatePodHealth` tool helps debug why a Pod (or pods under a Deployment) are unhealthy by collecting structured evidence:
+- pod phase/conditions, container states, restart counts
+- recent Events
+- recent container logs (tail)
+- probe summaries
+- service/endpoint evidence (selector + EndpointSlice membership)
+- PVC and node condition hints
+- NetworkPolicies selecting the pod (best-effort)
+
 ### Analyzer package layout
 
 - `src/analyzer/impactAnalyzer.ts`: impact entrypoint and kind dispatch
@@ -65,3 +79,4 @@ Current supported start kinds: `Service`, `Pod`, `Ingress`, `VirtualService`.
 - `src/analyzer/reverseLookup.ts`: reverse dependency lookups
 - `src/analyzer/trafficFlowAnalyzer.ts`: traffic flow entrypoint
 - `src/analyzer/traffic/*`: traffic graph/discovery/rendering helpers
+- `src/analyzer/podHealth/*`: pod health investigation helpers and evidence collectors

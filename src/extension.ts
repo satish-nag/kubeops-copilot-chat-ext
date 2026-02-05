@@ -2,6 +2,8 @@ import * as vscode from "vscode";
 import * as k8s from "@kubernetes/client-node";
 import { analyzeImpact } from "./analyzer/impactAnalyzer";
 import { analyzeTrafficFlow } from "./analyzer/trafficFlowAnalyzer";
+import { investigatePodHealth } from "./analyzer/podHealth/investigatePodHealth";
+
 
 // IMPORTANT: must match contributes.chatParticipants[id] in package.json
 const PARTICIPANT_ID = "kubecopilot.kubeops";
@@ -111,7 +113,9 @@ type ToolCall =
   | { tool: "getResource"; args: GetResourceArgs }
   | { tool: "createResource"; args: CreateOrPatchResourceArgs }
   | { tool: "patchResource"; args: PatchResourceArgs }
-  | { tool: "analyzeTrafficFlow"; args: { kind: string; name: string; namespace?: string; maxDepth?: number; includeIstio?: boolean } };;
+  | { tool: "analyzeTrafficFlow"; args: { kind: string; name: string; namespace?: string; maxDepth?: number; includeIstio?: boolean } }
+  | { tool: "analyzeTrafficFlow"; args: { kind: string; name: string; namespace?: string; maxDepth?: number; includeIstio?: boolean } }
+  | { tool: "investigatePodHealth"; args: { kind: "Pod" | "Deployment"; name: string; namespace?: string; podName?: string; maxPods?: number; tailLines?: number; sinceSeconds?: number } };
 
 // JSON tool plan structure returned by the planner ( LLM )
 type JsonToolPlan = {
@@ -333,7 +337,29 @@ async function chatRequestHandler(
             name: { type: "string" },
             namespace: { type: "string" },
             maxDepth: { type: "number" },
-            includeIstio: { type: "boolean" }
+            includeIstio: { type: "boolean" },
+            fromKind: { type: "string" },
+            fromName: { type: "string" },
+            fromNamespace: { type: "string" }
+          },
+          required: ["kind", "name"]
+        }
+      },
+      {
+        name: "investigatePodHealth",
+        description:
+          "Investigate unhealthy pods by collecting recent Pod events and recent container logs. Supports starting from a Pod, or a Deployment (will inspect its pods). Returns a structured diagnosis summary and evidence.",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            kind: { type: "string", enum: ["Pod", "Deployment"] },
+            name: { type: "string" },
+            namespace: { type: "string" },
+            podName: { type: "string", description: "Optional: if kind=Deployment and a specific pod should be investigated." },
+            maxPods: { type: "number", description: "Max pods to inspect when kind=Deployment (default 3)." },
+            tailLines: { type: "number", description: "How many log lines to fetch per container (default 120)." },
+            sinceSeconds: { type: "number", description: "Only return logs newer than this many seconds (default 1800)." }
           },
           required: ["kind", "name"]
         }
@@ -473,6 +499,14 @@ async function executeToolCalls(
       } catch (e) {
         results.push({ tool, args, result: { error: asErrorMessage(e) } });
       }
+    } else if (tool === "investigatePodHealth") {
+      try {
+        console.log("Invoking investigatePodHealth with args:", args);
+        const res = await investigatePodHealth(session.kubeConfig, args as any);
+        results.push({ tool, args, result: res });
+      } catch (e) {
+        results.push({ tool, args, result: { error: asErrorMessage(e) } });
+      }
     }
     else if (tool) {
       results.push({ tool: String(tool), args, result: { error: "Unknown tool" } });
@@ -506,7 +540,9 @@ Rules:
 - Only set done=true if the intent is ambiguous or the target resource cannot be determined.
 - If required inputs are missing (kind or name), do not call tools. Set done=true and explain what is missing in summary.
 - If user asks "impact of deleting", "what breaks if removed", or "impact analysis", call analyzeImpact.
-- If user asks for "traffic flow", "upstream/downstream", "how traffic reaches", or "request path", call analyzeTrafficFlow.
+- If user asks for "traffic flow", "upstream/downstream", "how traffic reaches", or "request path", call analyzeTrafficFlow. kind and name are mandatory arguments. but there are optional args like refer to the tool schema.
+- if the question is related to why traffic is not reaching a from service/pod to another to service/pod, call analyzeTrafficFlow with fromKind/fromName/fromNamespace and kind/name as the target.
+- If user asks a pod is unhealthy/crashing/not ready, wants investigation, wants pod events/logs, or asks to debug pods under a deployment, call investigatePodHealth Kind and name are mandatory arguments.
 - Do NOT call delete tools.
 
 IMPACT TOOL ACTION RULES:
@@ -593,6 +629,15 @@ TRAFFIC FLOW EXTENSION:
   - Render a Markdown table of edges with columns: From, To, Reason.
   - Do NOT invent nodes/edges; only use returned nodes/edges.
   - If edges is empty, state: "No traffic edges discovered from available data.".
+POD HEALTH INVESTIGATION EXTENSION:
+- If tool results include investigatePodHealth:
+  - Render a dedicated section titled "Pod Health Investigation".
+  - Start with a 2-3 sentence summary of the likely issue(s) using ONLY the returned diagnosis fields.
+  - Render a table per inspected pod showing: Pod, Phase, Ready, Restarts, Node, Top Reason.
+  - Include a short "Evidence" subsection with:
+    - Recent Events (top 10) as a table (Time, Type, Reason, Message)
+    - Recent Logs (tail) per container (truncate long lines if needed)
+  - Do NOT invent causes. If the tool returned "unknown", say what data is missing.
 
 Output format guidelines:
 - Start with a 2-3 line summary.

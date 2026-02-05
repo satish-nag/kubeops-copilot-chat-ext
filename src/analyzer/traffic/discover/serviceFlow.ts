@@ -9,6 +9,7 @@ import {
   listGateways,
   listDestinationRules
 } from "../k8s";
+import { discoverNetworkPoliciesForTraffic } from "./networkPolicyFlow";
 
 export async function discoverFromService(
   kc: k8s.KubeConfig,
@@ -16,16 +17,21 @@ export async function discoverFromService(
   name: string,
   namespace?: string,
   includeIstio = true,
-  focusPodName?: string
+  focusPodName?: string,
+  sourcePodName?: string,
+  sourceNamespace?: string
 ) {
   const ns = defaultNamespace(kc, namespace);
+
+  const core = kc.makeApiClient(k8s.CoreV1Api);
 
   // Downstream: Service -> EndpointSlice -> Pods
   const svc = makeNode("Service", name, ns, roleForKind("Service"));
 
-  // NOTE: We don't “read” the service here to stay light.
-  // If you want, you can read it and use selector directly.
-  // In practice: list pods by endpointslice is more precise than selector.
+  // Cache pod reads (EndpointSlices may reference the same pod multiple times)
+  const podCache = new Map<string, any>();
+  const seenNpEdges = new Set<string>(); // `${npName}=>${podName}`
+
   const slices = await listEndpointSlicesForService(kc, ns, name);
   for (const es of slices) {
     const esName = es?.metadata?.name;
@@ -42,8 +48,50 @@ export async function discoverFromService(
         // ✅ If we're analyzing flow starting from a specific pod, keep it limited to that pod.
         if (focusPodName && tr.name !== focusPodName) continue;
 
-        const podNode = makeNode("Pod", tr.name, tr.namespace ?? ns, roleForKind("Pod"));
+        const podNs = tr.namespace ?? ns;
+        const podName = tr.name;
+
+        const podNode = makeNode("Pod", podName, podNs, roleForKind("Pod"));
         gb.addEdge(esNode, podNode, "EndpointSlice endpoint targetRef -> Pod");
+
+        // ✅ NEW: attach NetworkPolicy evidence to the destination pod
+        try {
+          const cacheKey = `${podNs}/${podName}`;
+          let podObj = podCache.get(cacheKey);
+          if (!podObj) {
+            const res = await core.readNamespacedPod(podName, podNs);
+            podObj = (res as any).body ?? res;
+            podCache.set(cacheKey, podObj);
+          }
+
+          const findings = await discoverNetworkPoliciesForTraffic(kc, podNs, podObj, {
+            sourcePodName,
+            sourceNamespace: sourceNamespace ?? ns,
+            maxPolicies: 50
+            // destPort is optional; deny-all ingress does not need it
+          });
+          console.log(`Discovered ${findings.length} NetworkPolicies affecting Pod ${podNs}/${podName}`, findings);
+
+          for (const f of findings) {
+            const npNode = makeNode("NetworkPolicy", f.policy, podNs, roleForKind("NetworkPolicy"));
+
+            // De-dupe repeated NP->Pod edges
+            const edgeKey = `${podNs}/${f.policy}=>${podNs}/${podName}`;
+            if (seenNpEdges.has(edgeKey)) continue;
+            seenNpEdges.add(edgeKey);
+
+            // Make the edge reason explicit (helpful for the LLM output)
+            let reason = f.note;
+            if (f.denyAllIngress) reason = `DENY: ${f.note}`;
+            else if (typeof f.allowFromSource === "boolean") {
+              reason = `${f.allowFromSource ? "ALLOW" : "POTENTIAL DENY"}: ${f.note}`;
+            }
+
+            gb.addEdge(npNode, podNode, reason);
+          }
+        } catch {
+          // keep analysis light; ignore failures
+        }
       }
     }
   }
@@ -115,7 +163,6 @@ export async function discoverFromService(
 
     if (hitsService) {
       const vsNode = makeNode("VirtualService", vsName, ns, roleForKind("VirtualService"));
-      // NOTE: We'll add the direct VirtualService -> Service edge only if no matching DestinationRule is found.
 
       let matchedAnyDestinationRule = false;
 
@@ -127,7 +174,7 @@ export async function discoverFromService(
         }
       }
 
-      // ✅ NEW: VirtualService -> DestinationRule -> Service (if DR host matches)
+      // ✅ VirtualService -> DestinationRule -> Service (if DR host matches)
       for (const dest of matchedDestinations) {
         const dr = findMatchingDestinationRule(destinationRules, dest.host, name, ns);
         if (!dr) continue;
@@ -147,6 +194,7 @@ export async function discoverFromService(
         gb.addEdge(vsNode, drNode, `VirtualService traffic policy via DestinationRule${suffix}`);
         gb.addEdge(drNode, svc, "DestinationRule applies to this service host");
       }
+
       if (!matchedAnyDestinationRule) {
         const weights = matchedDestinations
           .map((d) => d.weight)
@@ -160,9 +208,6 @@ export async function discoverFromService(
       }
     }
   }
-
-  // (Optional) If you want to ensure Gateway exists, you can list gateways, but not necessary for edges.
-  // We keep it light by not validating gateway existence here.
 }
 
 function findMatchingDestinationRule(
