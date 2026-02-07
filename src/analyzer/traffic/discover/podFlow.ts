@@ -21,7 +21,7 @@ export async function discoverFromPod(
   for (const o of owners) {
     if (o?.kind && o?.name) {
       const ownerNode = makeNode(o.kind, o.name, ns, roleForKind(o.kind));
-      gb.addEdge(ownerNode, podNode, "Workload owns Pod (ownerReferences)");
+      // gb.addEdge(ownerNode, podNode, "Workload owns Pod (ownerReferences)");
     }
   }
 

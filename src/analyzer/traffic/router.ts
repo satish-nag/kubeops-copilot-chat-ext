@@ -9,6 +9,38 @@ import { discoverFromPod } from "./discover/podFlow";
 import { discoverFromIngress } from "./discover/ingressFlow";
 import { discoverFromVirtualService } from "./discover/virtualServiceFlow";
 
+// helper function to list pods for a deployment
+async function listPodsForDeployment(
+  kc: k8s.KubeConfig,
+  name: string,
+  namespace: string
+): Promise<string[]> {
+  const apps = kc.makeApiClient(k8s.AppsV1Api);
+  const core = kc.makeApiClient(k8s.CoreV1Api);
+
+  // Read deployment to get selector
+  const dep = await apps.readNamespacedDeployment(name, namespace);
+  const matchLabels = dep.body.spec?.selector?.matchLabels ?? {};
+  const labelSelector = Object.entries(matchLabels)
+    .map(([k, v]) => `${k}=${v}`)
+    .join(",");
+
+  if (!labelSelector) return [];
+
+  const pods = await core.listNamespacedPod(
+    namespace,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    labelSelector
+  );
+
+  return (pods.body.items ?? [])
+    .map(p => p.metadata?.name)
+    .filter((n): n is string => !!n);
+}
+
 /**
  * This is a skeleton router. We keep it simple:
  * - For each supported start kind, we run the appropriate discovery.
@@ -29,6 +61,25 @@ export async function discoverTraffic(
   gb.addNode(start);
 
   switch (kind) {
+    case "Deployment": {
+      // Resolve pods belonging to the deployment and reuse Pod discovery logic
+      const podNames = await listPodsForDeployment(kc, args.name, ns);
+
+      if (podNames.length === 0) {
+        gb.addWarning(`No pods found for Deployment ${args.name} in namespace ${ns}`);
+        break;
+      }
+
+      for (const podName of podNames) {
+        const services = await discoverFromPod(kc, gb, podName, ns);
+
+        // Same expansion logic as Pod case
+        for (const svcName of services) {
+          await discoverFromService(kc, gb, svcName, ns, includeIstio, podName);
+        }
+      }
+      break;
+    }
     case "Service":
       await discoverFromService(kc, gb, args.name, ns, includeIstio);
       break;
