@@ -1,9 +1,26 @@
-.vscode/**
-.github/**
+# Exclude everything by default that we don't want
 src/**
-scripts/**
+**/*.ts
+tsconfig*.json
+build.mjs
+prompt_backup
+flow.md
+changelog.md
+
+.vscode/**
+.git/**
+.gitignore
 node_modules/**
 **/*.map
-**/*.test.*
-**/__tests__/**
-tsconfig.json
+**/*.log
+
+# Exclude ALL build outputs first
+dist/**
+
+# Re-include ONLY runtime artifacts you actually need
+!dist/extension.js
+!dist/kubeClient.js
+!resources/**
+!package.json
+!README.md
+!LICENSE*
