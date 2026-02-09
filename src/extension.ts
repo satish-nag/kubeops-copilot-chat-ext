@@ -20,6 +20,29 @@ type GetResourceArgs = {
   includeSensitiveData?: boolean;
 };
 
+// Tool args for searchResources
+type SearchResourcesArgs = {
+  kind: string;
+  namespace?: string;
+  /**
+   * Client-side filter: include only resources whose metadata.name contains this substring.
+   */
+  nameContains?: string;
+  /**
+   * Kubernetes label selector (server-side), e.g. "app=nginx,version=v1".
+   */
+  labelSelector?: string;
+  /**
+   * Kubernetes field selector (server-side), e.g. "metadata.name=nginx".
+   * Note: field selectors are limited and kind-dependent.
+   */
+  fieldSelector?: string;
+  /**
+   * Max number of results to return (default 25, max 100).
+   */
+  limit?: number;
+};
+
 // High-level values to merge into the manifest for create/patch
 type ResourceValues = {
   metadata?: {
@@ -93,6 +116,26 @@ type ManifestToolResult = {
   }>;
 };
 
+// Tool execution results for searchResources
+type SearchToolResult = {
+  kind: string;
+  namespace?: string;
+  query: {
+    nameContains?: string;
+    labelSelector?: string;
+    fieldSelector?: string;
+    limit: number;
+  };
+  results: Array<{
+    apiVersion: string;
+    kind: string;
+    name: string;
+    namespace?: string;
+  }>;
+  returned: number;
+  truncated: boolean;
+};
+
 // Tool execution results for createResource/patchResource
 type WriteToolResult = {
   identity: ManifestToolResult["identity"];
@@ -106,6 +149,7 @@ type KubeSession = {
   getResource: (args: GetResourceArgs) => Promise<ManifestToolResult>;
   createResource: (args: CreateOrPatchResourceArgs) => Promise<WriteToolResult>;
   patchResource: (args: PatchResourceArgs) => Promise<WriteToolResult>;
+  searchResources: (args: SearchResourcesArgs) => Promise<SearchToolResult>;
 };
 
 // Tool call types used in planning
@@ -114,8 +158,8 @@ type ToolCall =
   | { tool: "createResource"; args: CreateOrPatchResourceArgs }
   | { tool: "patchResource"; args: PatchResourceArgs }
   | { tool: "analyzeTrafficFlow"; args: { kind: string; name: string; namespace?: string; maxDepth?: number; includeIstio?: boolean } }
-  | { tool: "analyzeTrafficFlow"; args: { kind: string; name: string; namespace?: string; maxDepth?: number; includeIstio?: boolean } }
-  | { tool: "investigatePodHealth"; args: { kind: "Pod" | "Deployment"; name: string; namespace?: string; podName?: string; maxPods?: number; tailLines?: number; sinceSeconds?: number } };
+  | { tool: "investigatePodHealth"; args: { kind: "Pod" | "Deployment"; name: string; namespace?: string; podName?: string; maxPods?: number; tailLines?: number; sinceSeconds?: number } }
+  | { tool: "searchResources"; args: SearchResourcesArgs };
 
 // JSON tool plan structure returned by the planner ( LLM )
 type JsonToolPlan = {
@@ -363,6 +407,24 @@ async function chatRequestHandler(
           },
           required: ["kind", "name"]
         }
+      },
+      {
+        name: "searchResources",
+        description:
+          "Search/list Kubernetes/Istio resources by kind with optional name substring filtering (client-side) and optional labelSelector/fieldSelector (server-side). Returns identities only (no full manifests).",
+        inputSchema: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            kind: { type: "string" },
+            namespace: { type: "string" },
+            nameContains: { type: "string" },
+            labelSelector: { type: "string" },
+            fieldSelector: { type: "string" },
+            limit: { type: "number" }
+          },
+          required: ["kind"]
+        }
       }
     ]
   };
@@ -507,8 +569,19 @@ async function executeToolCalls(
       } catch (e) {
         results.push({ tool, args, result: { error: asErrorMessage(e) } });
       }
-    }
-    else if (tool) {
+    } else if (tool === "searchResources") {
+      const validated = validateSearchResourcesArgs(args);
+      if (!validated.ok) {
+        results.push({ tool, args, result: { error: validated.error } });
+        continue;
+      }
+      try {
+        const res = await session.searchResources(validated.value);
+        results.push({ tool, args: validated.value, result: res });
+      } catch (e) {
+        results.push({ tool, args: validated.value, result: { error: asErrorMessage(e), ...kubeHttpErrorDetails(e) } });
+      }
+    } else if (tool) {
       results.push({ tool: String(tool), args, result: { error: "Unknown tool" } });
     }
   }
@@ -543,6 +616,8 @@ Rules:
 - If user asks for "traffic flow", "upstream/downstream", "how traffic reaches", or "request path", call analyzeTrafficFlow. kind and name are mandatory arguments. but there are optional args like refer to the tool schema.
 - if the question is related to why traffic is not reaching a from service/pod to another to service/pod, call analyzeTrafficFlow with fromKind/fromName/fromNamespace and kind/name as the target.
 - If user asks a pod is unhealthy/crashing/not ready, wants investigation, wants pod events/logs, or asks to debug pods under a deployment, call investigatePodHealth Kind and name are mandatory arguments.
+- If user asks to search/list/find resources of a kind (e.g., "find pods", "list services") call searchResources. Kind is required. Use labelSelector/fieldSelector if user provides them; use nameContains if user provides a substring.
+- For searchResources one of the following must be provided: nameContains, labelSelector, or fieldSelector. If none are provided, set done=true and explain that at least one filter is required.
 - Do NOT call delete tools.
 
 IMPACT TOOL ACTION RULES:
@@ -638,6 +713,12 @@ POD HEALTH INVESTIGATION EXTENSION:
     - Recent Events (top 10) as a table (Time, Type, Reason, Message)
     - Recent Logs (tail) per container (truncate long lines if needed)
   - Do NOT invent causes. If the tool returned "unknown", say what data is missing.
+SEARCH RESULTS EXTENSION:
+- If tool results include searchResources:
+  - Render a dedicated section titled "Search Results".
+  - Render a Markdown table with columns: Kind, Name, Namespace, apiVersion.
+  - List exactly the items from searchResources.result.results.
+  - If truncated=true, mention that results were truncated and suggest increasing limit or narrowing selectors.
 
 Output format guidelines:
 - Start with a 2-3 line summary.
@@ -960,6 +1041,62 @@ function validateGetResourceArgs(args: unknown):
   return { ok: true, value: { kind: kind.trim(), name: name.trim(), namespace: namespace?.trim() } };
 }
 
+function validateSearchResourcesArgs(args: unknown):
+  | { ok: true; value: SearchResourcesArgs }
+  | { ok: false; error: string } {
+  if (!args || typeof args !== "object") return { ok: false, error: "args must be an object" };
+
+  const kind = (args as any).kind;
+  const namespace = (args as any).namespace;
+  const nameContains = (args as any).nameContains;
+  const labelSelector = (args as any).labelSelector;
+  const fieldSelector = (args as any).fieldSelector;
+  const limitRaw = (args as any).limit;
+
+  if (typeof kind !== "string" || !kind.trim()) return { ok: false, error: "kind is required" };
+  if (namespace !== undefined && (typeof namespace !== "string" || !namespace.trim())) {
+    return { ok: false, error: "namespace must be a non-empty string when provided" };
+  }
+
+  if (
+    (nameContains === undefined || !nameContains.trim()) &&
+    (labelSelector === undefined || !labelSelector.trim()) &&
+    (fieldSelector === undefined || !fieldSelector.trim())
+  ) {
+    return { ok: false, error: "at least one of nameContains, labelSelector, or fieldSelector must be provided" };
+  }
+
+  if (nameContains !== undefined && (typeof nameContains !== "string" || !nameContains.trim())) {
+    return { ok: false, error: "nameContains must be a non-empty string when provided" };
+  }
+  if (labelSelector !== undefined && (typeof labelSelector !== "string" || !labelSelector.trim())) {
+    return { ok: false, error: "labelSelector must be a non-empty string when provided" };
+  }
+  if (fieldSelector !== undefined && (typeof fieldSelector !== "string" || !fieldSelector.trim())) {
+    return { ok: false, error: "fieldSelector must be a non-empty string when provided" };
+  }
+
+  let limit = 25;
+  if (limitRaw !== undefined) {
+    if (typeof limitRaw !== "number" || !Number.isFinite(limitRaw)) {
+      return { ok: false, error: "limit must be a number when provided" };
+    }
+    limit = Math.max(1, Math.min(100, Math.floor(limitRaw)));
+  }
+
+  return {
+    ok: true,
+    value: {
+      kind: kind.trim(),
+      namespace: namespace?.trim(),
+      nameContains: nameContains?.trim(),
+      labelSelector: labelSelector?.trim(),
+      fieldSelector: fieldSelector?.trim(),
+      limit
+    }
+  };
+}
+
 function asErrorMessage(e: unknown): string {
   const base = e instanceof Error ? e.message : String(e);
   const details = formatKubernetesHttpError(e);
@@ -1042,7 +1179,8 @@ async function kubeConnect(
       kubeConfig: kc,
       getResource: (args) => getResource(kc, args),
       createResource: (args) => createResource(kc, args),
-      patchResource: (args) => patchResource(kc, args)
+      patchResource: (args) => patchResource(kc, args),
+      searchResources: (args) => searchResources(kc, args),
     };
   } catch (e) {
     stream.markdown(
@@ -1115,6 +1253,94 @@ async function getResource(kc: k8s.KubeConfig, args: GetResourceArgs): Promise<M
     identity,
     sanitizedManifest: sanitizeManifest(body, { includeSensitiveData: args.includeSensitiveData === true }),
     referencedResources: extractReferencedResources(body)
+  };
+}
+
+async function searchResources(kc: k8s.KubeConfig, args: SearchResourcesArgs): Promise<SearchToolResult> {
+  const kind = normalizeKind(args.kind);
+  const apiVersion = resolveApiVersion(kind);
+
+  const namespaced = isNamespacedKind(kind);
+  const ns = namespaced
+    ? (args.namespace || kc.getContextObject(kc.getCurrentContext())?.namespace || "default")
+    : undefined;
+
+  const limit = Math.max(1, Math.min(100, Math.floor(args.limit ?? 25)));
+
+  const objApi = k8s.KubernetesObjectApi.makeApiClient(kc);
+
+  const baseObj: k8s.KubernetesObject & { metadata: { name?: string; namespace?: string } } = {
+    apiVersion,
+    kind,
+    metadata: {
+      ...(ns ? { namespace: ns } : {})
+    }
+  };
+
+  const apiVersionsToTry = apiVersionFallbacks(kind, apiVersion);
+
+  let lastErr: unknown;
+  let listObj: any;
+
+  for (const ver of apiVersionsToTry) {
+    try {
+      (baseObj as any).apiVersion = ver;
+      listObj = await objApi.list(
+        apiVersion,
+        kind,
+        ns,
+        undefined,   // pretty
+        undefined,   // exact
+        undefined,   // exportt
+        args?.fieldSelector?.trim(),
+        args?.labelSelector?.trim(),
+        limit,
+        undefined,   // continueToken
+        undefined    // options
+      );
+      lastErr = undefined;
+      break;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+
+  if (lastErr) {
+    throw new Error(`Failed to list ${kind}${ns ? " in " + ns : ""}: ${asErrorMessage(lastErr)}`);
+  }
+
+  const body = (listObj as any)?.body ?? listObj;
+  const items: any[] = body?.items ?? [];
+
+  const needle = args.nameContains?.trim();
+  const filtered = needle
+    ? items.filter((it) => String(it?.metadata?.name ?? "").includes(needle))
+    : items;
+
+  // Hard cap returned identities to limit (even if server ignores limit).
+  const capped = filtered.slice(0, limit);
+
+  const results = capped
+    .map((it) => ({
+      apiVersion: String(it?.apiVersion ?? apiVersion),
+      kind: String(it?.kind ?? kind),
+      name: String(it?.metadata?.name ?? ""),
+      ...(it?.metadata?.namespace ? { namespace: String(it.metadata.namespace) } : ns ? { namespace: ns } : {})
+    }))
+    .filter((r) => r.name);
+
+  return {
+    kind,
+    ...(ns ? { namespace: ns } : {}),
+    query: {
+      ...(needle ? { nameContains: needle } : {}),
+      ...(args.labelSelector ? { labelSelector: args.labelSelector.trim() } : {}),
+      ...(args.fieldSelector ? { fieldSelector: args.fieldSelector.trim() } : {}),
+      limit
+    },
+    results,
+    returned: results.length,
+    truncated: filtered.length > limit
   };
 }
 
