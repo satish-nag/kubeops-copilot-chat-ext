@@ -620,6 +620,15 @@ Rules:
 - For searchResources one of the following must be provided: nameContains, labelSelector, or fieldSelector. If none are provided, set done=true and explain that at least one filter is required.
 - Do NOT call delete tools.
 
+REFERENCE-FIRST RULE (NO GUESSING):
+- If the user request implies a search filter that could be derived from an existing object (selectors, targetRefs, scaleTargetRef, backend service, gateways, etc.), you MUST first call getResource on the referenced object(s) and derive the exact selector/refs from the manifest. Do NOT guess labels like "app=...".
+- Only call searchResources AFTER you have derived labelSelector/fieldSelector from getResource output.
+- If the required selector/reference is not present in the manifest, set done=true and say what field is missing (do not invent a selector).
+  Examples (reference-first):
+  1) "pods managed by deployment X" -> getResource Deployment X -> searchResources Pod with labelSelector from spec.selector.matchLabels
+  2) "pods behind service S" -> getResource Service S -> searchResources Pod with labelSelector from spec.selector
+  3) "ingress backends for ingress I" -> getResource Ingress I -> searchResources Service using names from spec.rules[].http.paths[].backend.service.name (no guessing)
+
 IMPACT TOOL ACTION RULES:
 - If user asks about deleting/removing a resource, call analyzeImpact with action="delete".
 - If user asks about updating/changing/patching/shifting traffic/weights, call analyzeImpact with action="update".
