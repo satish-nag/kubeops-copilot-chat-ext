@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as k8s from "@kubernetes/client-node";
 import { analyzeImpact } from "./analyzer/impactAnalyzer";
 import { analyzeTrafficFlow } from "./analyzer/trafficFlowAnalyzer";
-import { investigatePodHealth } from "./analyzer/podHealth/investigatePodHealth";
+import { investigatePodHealth,fetchPodEvents } from "./analyzer/podHealth/investigatePodHealth";
 
 
 // IMPORTANT: must match contributes.chatParticipants[id] in package.json
@@ -1232,10 +1232,12 @@ async function getResource(kc: k8s.KubeConfig, args: GetResourceArgs): Promise<M
 
   let lastErr: unknown;
   let readObj: any;
+  let events: any
   for (const ver of apiVersionsToTry) {
     try {
       (baseObj as any).apiVersion = ver;
       readObj = await objApi.read(baseObj);
+      events = await fetchPodEvents(kc.makeApiClient(k8s.CoreV1Api), ns ?? "default", args.name);
       lastErr = undefined;
       break;
     } catch (e) {
@@ -1261,7 +1263,8 @@ async function getResource(kc: k8s.KubeConfig, args: GetResourceArgs): Promise<M
   return {
     identity,
     sanitizedManifest: sanitizeManifest(body, { includeSensitiveData: args.includeSensitiveData === true }),
-    referencedResources: extractReferencedResources(body)
+    referencedResources: extractReferencedResources(body),
+    ...(events ? { events } : {})
   };
 }
 

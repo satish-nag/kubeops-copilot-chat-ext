@@ -13,7 +13,8 @@ This repository contains a VS Code extension that registers a GitHub Copilot Cha
 ## Status
 
 The extension implements an agentic, tool-calling flow that can:
-- Read a single Kubernetes/Istio object (`getResource`)
+- Read a single Kubernetes/Istio object (`getResource`, includes referenced resources and recent Events)
+- Search/list resources by kind with filters (`searchResources`)
 - Create a single object (`createResource`)
 - Patch/update a single object via server-side apply (`patchResource`)
 - Analyze impact for delete/update operations (`analyzeImpact`)
@@ -39,6 +40,16 @@ For `createResource` / `patchResource`, the model is encouraged to send `values`
 
 You can still provide `manifestYaml` as a fallback for complex objects, but it must contain exactly one YAML document.
 
+### Search/list resources
+
+The `searchResources` tool is used for “list/find” queries when you only need identities (not full manifests). It supports:
+
+- `labelSelector` and `fieldSelector` (server-side filtering)
+- `nameContains` (client-side substring filter)
+- `namespace` and `limit` (default 25, max 100)
+
+Important: at least one filter must be provided (`nameContains`, `labelSelector`, or `fieldSelector`), otherwise the tool rejects the call.
+
 ### Impact analysis
 
 The `analyzeImpact` tool inspects reverse dependencies to estimate what would be affected by a delete or update request. It reports:
@@ -58,6 +69,12 @@ The `analyzeTrafficFlow` tool discovers upstream/downstream relationships and re
 - Mermaid output for visualization in chat
 
 Current supported start kinds: `Service`, `Pod`, `Ingress`, `VirtualService`.
+
+Tool args:
+- `namespace` (optional; defaults to current kube context namespace or `default`)
+- `includeIstio` (optional; default true)
+- `maxDepth` (optional; currently not used for a general BFS expansion)
+- `fromKind` / `fromName` / `fromNamespace` (accepted by the tool schema for “source → target” questions, but not yet used to constrain discovery)
 
 It also attempts to attach network-policy evidence to destination pods (best-effort) when discovering flows from Services.
 

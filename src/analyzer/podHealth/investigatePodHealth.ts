@@ -206,7 +206,7 @@ async function inspectOnePod(
     };
 }
 
-async function fetchPodEvents(core: k8s.CoreV1Api, ns: string, podName: string): Promise<PodEventItem[]> {
+export async function fetchPodEvents(core: k8s.CoreV1Api, ns: string, podName: string): Promise<PodEventItem[]> {
     try {
         // Use fieldSelector for involvedObject.name (works widely)
         const fieldSelector = `involvedObject.name=${podName}`;

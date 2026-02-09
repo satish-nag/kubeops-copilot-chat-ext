@@ -4,13 +4,60 @@ This document explains, in detail, what `src/extension.ts` does at runtime. It d
 
 ---
 
+### Flow Diagram (Mermaid)
+
+```mermaid
+flowchart TD
+  A["VS Code activates extension"] --> B["activate(): register @kubeops participant"]
+  B --> C["User sends message to @kubeops"]
+  C --> D["chatRequestHandler()"]
+  D --> E["kubeConnect(): load kubeconfig + connectivity check"]
+  E -->|fails| E1[Respond with connection error] --> END1([Stop])
+  E -->|ok| F[Parse userText]
+
+  F --> G{Is userText\n`confirm`/`cancel`?}
+  G -->|yes| H["Resolve pending bundle\n(by id or latest)"]
+  H --> I{cancel?}
+  I -->|yes| J[Delete bundle + respond canceled] --> END2([Stop])
+  I -->|no: confirm| K["Delete bundle + apply ops sequentially\n(createResource/patchResource)"]
+  K --> L["Build final reporter prompt + sendText()"]
+  L --> M[Stream final Markdown] --> END3([Stop])
+
+  G -->|no| N[Build toolCatalog schemas]
+  N --> O["Planner loop (max iterations)"]
+  O --> P["buildPlanningPrompt(userText, toolCatalog, priorResults, iteration)"]
+  P --> Q["sendJsonOnly(): model returns plan JSON\n+ 1 repair retry if invalid JSON"]
+  Q --> R{Plan includes any\ncreateResource/patchResource?}
+  R -->|yes| S["Preview writes:\n- buildWriteManifest\n- getResource (previous)\n- sanitize + diff] --> T[Store bundle in pendingWriteApprovals"]
+  T --> U[Render preview + ask user\nto `confirm <id>`/`cancel <id>`] --> END4([Stop])
+
+  R -->|no| V["executeToolCalls(): validate + execute"]
+  V --> W[Tool results appended to priorResults]
+  W --> X{"Stop condition:\n(done && no errors)\nOR no toolCalls?"}
+  X -->|no| O
+  X -->|yes| Y["buildFinalPrompt(userText, toolCatalog, toolResults)"]
+  Y --> Z["sendText(): reporter Markdown"]
+  Z --> M
+
+  subgraph Tools["Tools executed by executeToolCalls()"]
+    V1[getResource]
+    V2[searchResources]
+    V3[createResource]
+    V4[patchResource]
+    V5[analyzeImpact]
+    V6[analyzeTrafficFlow]
+    V7[investigatePodHealth]
+  end
+  V --> Tools
+```
+
 ## 1) What this file is responsible for
 
 `src/extension.ts` implements a **GitHub Copilot Chat participant** (`@kubeops`) that:
 
 1. Connects to a Kubernetes cluster using your local kubeconfig rules.
 2. Lets a language model **plan** a sequence of tool calls (in strict JSON).
-3. Executes those tool calls against the Kubernetes API (read / create / patch).
+3. Executes those tool calls against the Kubernetes API (read / search / create / patch / analyze).
 4. Feeds tool results back into the model and asks it to produce a final Markdown response.
 
 It is effectively a small “agent loop” inside a VS Code extension:
@@ -33,6 +80,7 @@ Key internal functions (high level):
 - `chatRequestHandler(...)`: the main orchestration loop (connect → plan → execute → respond).
 - `executeToolCalls(session, toolCalls)`: validates and executes tool calls.
 - `getResource(...)`: reads one object from the cluster and returns a sanitized manifest + references.
+- `searchResources(...)`: lists resources by kind with selectors/filters (identities only).
 - `createResource(...)`: creates one object from LM-provided values / yaml.
 - `patchResource(...)`: patches one object using **server-side apply**.
 - `analyzeImpact(...)`: computes delete-impact severity and dependencies.
@@ -43,7 +91,7 @@ Support functions:
 
 - Prompt builders: `buildPlanningPrompt`, `buildFinalPrompt`
 - Model calls: `sendText`, `sendJsonOnly`, `extractFirstJsonObject`
-- Validation: `validateGetResourceArgs`, `validateCreateOrPatchArgs`, `validatePatchArgs`
+- Validation: `validateGetResourceArgs`, `validateSearchResourcesArgs`, `validateCreateOrPatchArgs`, `validatePatchArgs`
 - Kubernetes/Istio mapping: `normalizeKind`, `resolveApiVersion`, `apiVersionFallbacks`, `isIstioKind`, `isNamespacedKind`
 - Manifest shaping: `buildWriteManifest`, `normalizeValuesForKind`, `parseSingleManifestYaml`
 - Output shaping: `sanitizeManifest`, `extractReferencedResources`
@@ -119,6 +167,7 @@ If it’s empty, it prints a hint and stops.
 The handler constructs a JSON object describing available tools:
 
 - `getResource`
+- `searchResources`
 - `createResource`
 - `patchResource`
 - `analyzeImpact`
@@ -161,9 +210,10 @@ Then it loops up to 5 times:
 `sendJsonOnly(model, planningPrompt)`:
 
 1. Calls `sendText(...)` to get raw text from the model.
-2. Extracts the **first JSON object** it can find via `extractFirstJsonObject(...)`.
-3. Parses it with `JSON.parse(...)`.
-4. Normalizes missing fields:
+2. Strips common Markdown code fences (best-effort).
+3. Extracts the **first JSON object** it can find via `extractFirstJsonObject(...)`.
+4. Parses it with `JSON.parse(...)`.
+5. Normalizes missing fields:
    - ensures `toolCalls` exists as an array
    - ensures `done` is boolean
 
@@ -174,7 +224,7 @@ If parsing fails, the handler prints:
 Error: ...
 ```
 
-and stops.
+The extension also makes one “repair” attempt: it asks the model to rewrite its previous response as strict valid JSON only. If that repair attempt also fails, the handler stops.
 
 Why this can fail:
 
@@ -190,7 +240,7 @@ Important limitation:
 
 The plan contains `toolCalls`, each with:
 
-- `tool`: `"getResource" | "createResource" | "patchResource" | "analyzeImpact" | "analyzeTrafficFlow" | "investigatePodHealth"`
+- `tool`: `"getResource" | "searchResources" | "createResource" | "patchResource" | "analyzeImpact" | "analyzeTrafficFlow" | "investigatePodHealth"`
 - `args`: the tool-specific argument object
 
 The handler calls:
@@ -237,6 +287,7 @@ This function iterates through tool calls and for each one:
 Validation helpers:
 
 - `validateGetResourceArgs`
+- `validateSearchResourcesArgs`
 - `validateCreateOrPatchArgs`
 - `validatePatchArgs`
 
@@ -280,6 +331,7 @@ The tool returns:
 - `identity`: apiVersion/kind/name/namespace
 - `sanitizedManifest`: from `sanitizeManifest(...)`
 - `referencedResources`: from `extractReferencedResources(...)`
+- `events` (optional): recent Events matching `involvedObject.name=<name>` in the same namespace (primarily useful when reading Pods)
 
 Sanitization is designed to:
 
@@ -466,8 +518,9 @@ The enforcement mechanism is:
 
 - `buildPlanningPrompt` instructs “Output ONLY valid JSON”
 - `sendJsonOnly` extracts the first `{...}` and `JSON.parse`s it
+- If parsing fails, `sendJsonOnly` re-prompts once to “rewrite as strict valid JSON only” (repair attempt)
 
-If the model violates the contract, the handler stops early.
+If the model violates the contract twice (initial + repair), the handler stops early.
 
 ---
 
@@ -488,7 +541,7 @@ Common extensions:
 
 3. **Improve planner reliability**
    - Consider a stricter JSON extraction strategy
-   - Consider retrying planner call on parse failure with a “repair” prompt
+   - (Already implemented) Retry once on parse failure with a “repair” prompt
    - Consider validating against a JSON schema rather than ad-hoc type checks
 
 4. **Reduce SSA conflicts**
@@ -564,15 +617,7 @@ Pending approvals are stored in an in-memory `Map` in the extension host process
 
 ---
 
-## 14) Quick mental model summary
-
-In one sentence:
-
-`extension.ts` runs a “plan → execute → report” loop where the model outputs strict JSON tool calls, the extension runs them against Kubernetes, and the model then writes a Markdown report using only the tool results.
-
----
-
-## 15) Tool: `analyzeTrafficFlow` (traffic graph + Mermaid)
+## 14) Tool: `analyzeTrafficFlow` (traffic graph + Mermaid)
 
 `analyzeTrafficFlow` builds a directed traffic graph and Mermaid diagram from a starting object. It is designed to answer questions like “how does traffic reach X” or “what’s upstream/downstream of this Service/Pod/Ingress/VirtualService”.
 
@@ -581,6 +626,8 @@ Implemented behavior:
 - Supported start kinds today: `Service`, `Pod`, `Ingress`, `VirtualService` (others return warnings).
 - Namespace defaults from kube context when omitted.
 - `includeIstio` defaults to true and enables VirtualService/Gateway/DestinationRule discovery.
+- `maxDepth` exists in the tool schema but is currently not used for a general BFS expansion (service discovery already does a small multi-hop chain).
+- The tool schema also accepts `fromKind`/`fromName`/`fromNamespace` to describe a “source → target” question, but current discovery is primarily target-centric (the `from*` fields are not yet used to constrain discovery).
 - Output includes:
   - `nodes[]` (typed traffic nodes)
   - `edges[]` with human-readable `reason`
@@ -603,6 +650,7 @@ Analyzer package structure:
 - `src/analyzer/trafficFlowAnalyzer.ts`: entrypoint + start object existence checks.
 - `src/analyzer/traffic/router.ts`: dispatch by start kind.
 - `src/analyzer/traffic/discover/*.ts`: discovery logic per source kind.
+- `src/analyzer/traffic/discover/networkPolicyFlow.ts`: best-effort NetworkPolicy evaluation for destination pods.
 - `src/analyzer/traffic/k8s.ts`: Kubernetes/Istio API helpers (including EndpointSlice lookup fallback).
 - `src/analyzer/traffic/graph.ts`: graph builder + edge de-dup.
 - `src/analyzer/traffic/mermaid.ts`: graph-to-Mermaid rendering.
@@ -610,7 +658,7 @@ Analyzer package structure:
 
 ---
 
-## 16) Tool: `investigatePodHealth` (pod/deployment health investigation)
+## 15) Tool: `investigatePodHealth` (pod/deployment health investigation)
 
 `investigatePodHealth` collects structured evidence to explain why a Pod (or pods under a Deployment) are unhealthy.
 
@@ -629,3 +677,55 @@ Evidence gathered (best-effort):
 - Service/Endpoint evidence: which Services select the pod, and whether it appears in EndpointSlices
 - PVC and Node condition hints
 - NetworkPolicies selecting the pod (matchLabels-only, bounded list)
+
+---
+
+## 16) Tool: `searchResources` (list/find identities)
+
+`searchResources` is used when the user asks to list/find resources of a given kind using selectors or a name substring, without needing full manifests.
+
+Example questions:
+
+- “List pods with label `app=nginx` in `default`”
+- “Find services containing `payments` in the name”
+- “Show NetworkPolicies with `team=platform`”
+
+### 16.1 Inputs and constraints
+
+Inputs:
+
+- `kind` (required)
+- `namespace` (optional; defaults the same way as other namespaced tools)
+- `labelSelector` (optional, server-side), e.g. `app=nginx,version=v1`
+- `fieldSelector` (optional, server-side), e.g. `metadata.name=nginx` (field selectors are limited and kind-dependent)
+- `nameContains` (optional, client-side substring filter)
+- `limit` (optional; default 25, max 100)
+
+Important constraint: at least **one** of `nameContains`, `labelSelector`, or `fieldSelector` must be provided. If none are present, the extension rejects the tool call and returns an error (the planner prompt also instructs the model not to call `searchResources` without a filter).
+
+### 16.2 Execution behavior
+
+The tool:
+
+1. Normalizes kind and resolves apiVersion similarly to `getResource`.
+2. Lists resources using server-side `labelSelector` / `fieldSelector` when provided.
+3. Applies `nameContains` as a client-side filter over returned items.
+4. Returns **identities only** (no full manifests), capped to `limit`.
+
+### 16.3 Output shape
+
+The result includes:
+
+- `kind` / `namespace` (if applicable)
+- `query` echo (filters applied and effective limit)
+- `results[]`: list of `{ apiVersion, kind, name, namespace? }`
+- `returned`: number of results returned
+- `truncated`: whether the result set was truncated due to `limit`
+
+---
+
+## 17) Quick mental model summary
+
+In one sentence:
+
+`extension.ts` runs a “plan → execute → report” loop where the model outputs strict JSON tool calls, the extension runs them against Kubernetes, and the model then writes a Markdown report using only the tool results.
