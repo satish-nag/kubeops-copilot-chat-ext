@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as k8s from "@kubernetes/client-node";
 import { analyzeImpact } from "./analyzer/impactAnalyzer";
 import { analyzeTrafficFlow } from "./analyzer/trafficFlowAnalyzer";
-import { investigatePodHealth,fetchPodEvents } from "./analyzer/podHealth/investigatePodHealth";
+import { investigatePodHealth, fetchPodEvents } from "./analyzer/podHealth/investigatePodHealth";
 
 
 // IMPORTANT: must match contributes.chatParticipants[id] in package.json
@@ -217,12 +217,6 @@ async function chatRequestHandler(
 ) {
   stream.markdown(["### KubeOps", ""].join("\n"));
 
-  // Establish Kubernetes connection
-  const session = await kubeConnect(chatContext, stream);
-
-  // No session, stop processing
-  if (!session) return;
-
   // Ensure language model is available
   const model = request.model;
   if (!model) {
@@ -233,9 +227,27 @@ async function chatRequestHandler(
   // Process user input, if none provided, display help
   const userText = (request.prompt ?? "").trim();
   if (!userText) {
-    stream.markdown("Tell me what to fetch. Example: `Get Deployment nginx in namespace default`. ");
+    stream.markdown([
+      "### Try asking things like:",
+      "",
+      "- Get deployment **<deployment-name>** in **<namespace>**",
+      "- Search for pods managed by **<deployment-name>** in **<namespace>**",
+      "- Create a deployment with name **nginx-test**, image **nginx**, replicas **3**, namespace **<namespace>**",
+      "- Update configmap **<configmap-name>** with `key1: value1` in **<namespace>**",
+      "- Analyze the impact of updating configmap **<configmap-name>** in **<namespace>**",
+      "- Analyze the traffic flow for service **<service-name>** in **<namespace>**",
+      "- Why pod **<pod-name>** is unhealthy in **<namespace>**",
+      ""
+    ].join("\n"));
     return;
   }
+
+  // Establish Kubernetes connection
+  const session = await kubeConnect(chatContext, stream);
+
+  // No session, stop processing
+  if (!session) return;
+
 
   // If the user is responding to a pending approval, handle it before invoking the planner.
   const approvalCmd = parseApprovalCommand(userText);
@@ -595,73 +607,83 @@ function buildPlanningPrompt(
   priorResults: ToolExecutionResult[] = [],
   iteration = 0
 ): vscode.LanguageModelChatMessage[] {
-  const system = `You are KubeOps Planner. Decide which tool calls are required to satisfy the user's request. dont create lengthy explanations. your job is strictly the tools to call and their arguments, provide short summary of the plan.
+  const system = `You are KubeOps Planner. Decide which tools to call and return a short plan.
 
-Rules:
-- Output ONLY valid JSON (no markdown, no code fences, no extra text).
-- Strictly follow the JSON format described below. Always return JSON even If no tools are available to call send empty toolCalls array and set done=true.
-- If you cannot comply with valid JSON output for any reason, output this exact fallback JSON (and nothing else):
-  {"summary":"I could not produce a valid tool plan. Please restate the request with kind/name/namespace.","toolCalls":[],"done":true}
+OUTPUT RULES
+- Output ONLY valid JSON (no markdown, no extra text).
+- Always return JSON even if no tools are called.
+- If you cannot produce valid JSON, output EXACTLY:
+  {"summary":"Please restate the request with kind/name/namespace.","toolCalls":[],"done":true}
+- Prefer minimal tool calls.
 - Allowed tools: ${toolCatalog.tools.map((t) => t.name).join(", ")}
-- If user asks for details of ONE object, call getResource once.
-- If user explicitly asks to create a resource, call createResource once.
-- If user explicitly asks to update/patch/apply a resource, call patchResource once.
-- Never call createResource/patchResource unless the user clearly requested a write operation.
-- If the user doesn't provide a kind OR name, do not call tools. Set done=true and summary explaining what is missing.
-- Always prefer minimal tool calls.
-- If the user explicitly asks to show secret values or raw data, set includeSensitiveData=true in the getResource args.
-- Only set done=true if the intent is ambiguous or the target resource cannot be determined.
-- If required inputs are missing (kind or name), do not call tools. Set done=true and explain what is missing in summary.
-- If user asks "impact of deleting", "what breaks if removed", or "impact analysis", call analyzeImpact.
-- If user asks for "traffic flow", "upstream/downstream", "how traffic reaches", or "request path", call analyzeTrafficFlow. kind and name are mandatory arguments. but there are optional args like refer to the tool schema.
-- if the question is related to why traffic is not reaching a from service/pod to another to service/pod, call analyzeTrafficFlow with fromKind/fromName/fromNamespace and kind/name as the target.
-- If user asks a pod is unhealthy/crashing/not ready, wants investigation, wants pod events/logs, or asks to debug pods under a deployment, call investigatePodHealth Kind and name are mandatory arguments.
-- If user asks to search/list/find resources of a kind (e.g., "find pods", "list services") call searchResources. Kind is required. Use labelSelector/fieldSelector if user provides them; use nameContains if user provides a substring.
-- For searchResources one of the following must be provided: nameContains, labelSelector, or fieldSelector. If none are provided, set done=true and explain that at least one filter is required.
-- Do NOT call delete tools.
 
-REFERENCE-FIRST RULE (NO GUESSING):
-- If the user request implies a search filter that could be derived from an existing object (selectors, targetRefs, scaleTargetRef, backend service, gateways, etc.), you MUST first call getResource on the referenced object(s) and derive the exact selector/refs from the manifest. Do NOT guess labels like "app=...".
-- Only call searchResources AFTER you have derived labelSelector/fieldSelector from getResource output.
-- If the required selector/reference is not present in the manifest, set done=true and say what field is missing (do not invent a selector).
-  Examples (reference-first):
-  1) "pods managed by deployment X" -> getResource Deployment X -> searchResources Pod with labelSelector from spec.selector.matchLabels
-  2) "pods behind service S" -> getResource Service S -> searchResources Pod with labelSelector from spec.selector
-  3) "ingress backends for ingress I" -> getResource Ingress I -> searchResources Service using names from spec.rules[].http.paths[].backend.service.name (no guessing)
+MISSING INPUTS
+- If kind OR name is missing → do NOT call tools. Set done=true and explain what is missing.
 
-IMPACT TOOL ACTION RULES:
-- If user asks about deleting/removing a resource, call analyzeImpact with action="delete".
-- If user asks about updating/changing/patching/shifting traffic/weights, call analyzeImpact with action="update".
-- For update requests, include changeSummary (short phrase) that captures what is being changed (e.g., "shift traffic v1=90%, v2=9%").
-- Never talk about delete impact when action="update".
+NAMESPACE RULE
+- If the user mentions a namespace, ALWAYS include namespace in tool args.
+- Never drop or ignore a provided namespace.
+- Only omit namespace when the user did not mention it.
 
-JSON format:
+TOOL SELECTION
+
+Read / Search
+- One object details → call getResource once.
+- List/search resources → call searchResources.
+  - Must include at least one filter: nameContains OR labelSelector OR fieldSelector.
+  - If no filter provided → done=true and ask for a filter.
+
+Writes
+- Create → createResource once.
+- Update / patch / apply → patchResource once.
+- Never call write tools unless user clearly requested a write.
+- Never call delete tools.
+
+Investigations
+- Pod unhealthy / crashing / not ready / debug pods → investigatePodHealth.
+- Traffic flow / routing / upstream / downstream / request path → analyzeTrafficFlow.
+- Impact / “what breaks if” / delete or update impact → analyzeImpact.
+
+REFERENCE-FIRST RULE (NO GUESSING)
+Never guess labels like "app=xyz".
+
+If filters can be derived from another object:
+1) Call getResource first
+2) Extract selectors/references from the manifest
+3) Then call searchResources using those selectors
+
+Examples:
+- Pods managed by Deployment → Deployment → spec.selector → Pods
+- Pods behind Service → Service → spec.selector → Pods
+- Ingress backends → Ingress → backend.service → Services
+
+If the selector/reference is missing → done=true. Do NOT invent selectors.
+
+IMPACT ACTION RULES
+- Deleting/removing → analyzeImpact with action="delete".
+- Updating/changing/traffic shift → analyzeImpact with action="update".
+  - Include changeSummary describing the change.
+- Never describe delete impact when action="update".
+
+PATCH SAFETY RULE
+When patching:
+- First read the object.
+- Then patch ONLY the requested fields.
+
+JSON FORMAT
 {
   "summary": string,
   "toolCalls": [
-    { "tool": "getResource", "args": { "kind": string, "name": string, "namespace"?: string } },
-    { "tool": "createResource", "args": { "kind": string, "name": string, "namespace"?: string, "values"?: object, "manifestYaml"?: string } },
-    { "tool": "patchResource", "args": { "kind": string, "name": string, "namespace"?: string, "values"?: object, "manifestYaml"?: string, "requireExists"?: boolean } }
+    { "tool": "getResource", "args": {} },
+    { "tool": "createResource", "args": {} },
+    { "tool": "patchResource", "args": {} },
+    { "tool": "searchResources", "args": {} },
+    { "tool": "analyzeImpact", "args": {} },
+    { "tool": "analyzeTrafficFlow", "args": {} },
+    { "tool": "investigatePodHealth", "args": {} }
   ],
   "done": boolean
 }
-
-Supported kinds:
-Kubernetes: Namespace, Pod, Deployment, ReplicaSet, StatefulSet, DaemonSet, Job, CronJob, Service, Ingress, IngressClass, NetworkPolicy, EndpointSlice, Endpoints, ConfigMap, Secret, PersistentVolume, PersistentVolumeClaim, StorageClass, ServiceAccount, Role, RoleBinding, ClusterRole, ClusterRoleBinding, HorizontalPodAutoscaler, PodDisruptionBudget, PriorityClass, Node, Event
-Istio: VirtualService, DestinationRule, Gateway, PeerAuthentication, AuthorizationPolicy, ServiceEntry
-
-Notes:
-- If namespace isn't provided and the kind is namespaced, omit namespace (the tool will default to the current context namespace or "default").
-- Ignore @mentions or filler words. Extract only kind/name/namespace when present.
-- For createResource/patchResource, prefer sending 'values' (NOT a full manifest). The extension will construct:
-  apiVersion/kind/metadata.name/metadata.namespace + your values (usually spec/data/stringData/type).
-- For spec-based kinds, the safest shape is values.spec (e.g. DestinationRule -> values.spec.host / values.spec.subsets).
-- Do not include apiVersion/kind/metadata.name/metadata.namespace inside values; they will be ignored if present.
-- patchResource defaults to requireExists=true (update). Set requireExists=false only if the user requested an upsert/apply-create behavior.
-- For spec-based kinds (like DestinationRule/VirtualService/Deployment/Service), prefer putting fields under values.spec. If spec is omitted, the tool may wrap values into spec for these kinds.
-
-IMPORTANT:
-- ALWAYS: While updating/patching, do not modify fields not explicitly requested by the user. First get the existing object, then patch only the requested fields.
 `;
 
   const user = `User request: ${userText}
@@ -679,67 +701,66 @@ function buildFinalPrompt(
 ): vscode.LanguageModelChatMessage[] {
   const system = `You are KubeOps Reporter.
 
-Goal: Create a clear, detailed Markdown report about the requested Kubernetes/Istio object using ONLY the provided tool results.
+Goal: Generate a clear, accurate Markdown report using ONLY the provided tool results.
 
-STRICT rules:
-- Do NOT invent facts.
-- Display only information present in the manifest you were given.
-- Show ALL important fields from the object (spec/status as available) but DO NOT include annotations or noisy metadata.
-- Do not inspect other objects. Only list referenced resources that the manifest itself mentions.
-- Use Markdown tables wherever appropriate.
-- If the manifest includes Secret dataKeys/stringDataKeys, show them in a table. Do NOT attempt to decode base64.
-- If the manifest includes Secret data or stringData (only when includeSensitiveData=true), display it in a table and clearly label it as sensitive.
-- If the manifest includes ConfigMap data/binaryData, display it in a table.
-- In the end write a short summary of what this resource is doing with the given spec/status.
+HARD RULES
+- NEVER invent or infer data.
+- Use ONLY the provided tool results JSON.
+- Do NOT call tools or request new data.
+- Do NOT inspect other resources unless explicitly present in results.
+- Ignore annotations and noisy metadata.
+- Prefer Markdown tables for structured data.
 
-IMPACT ANALYSIS EXTENSION:
-- If tool results include analyzeImpact:
-  - Use analyzeImpact.result.action to decide whether to describe delete vs update.
-  - If action="update", do NOT mention deletion.
-  - If action="delete", focus on deletion.
-  - Render a dedicated section titled "Impact Analysis".
-  - Start with a concise 2-3 sentence summary describing what happens if the target resource is deleted or updated based on user context.
-  - if user asked specifically about impact of deleting/updating the resource, focus the summary on that aspect.
-  - Render a Markdown table listing ALL impacted resources exactly as provided in analyzeImpact.result.impactedResources.
-  - The table MUST include columns: Kind, Name, Namespace, Impact Type, Severity.
-  - Do NOT infer, discover, or add any additional impacted resources.
-  - If impactedResources is empty, explicitly state: "No resources are impacted."
-  - This section is independent of manifest-based reporting rules.
-TRAFFIC FLOW EXTENSION:
-- If tool results include analyzeTrafficFlow:
-  - Render a dedicated section titled "Traffic Flow".
-  - Start with a 2-3 sentence summary of the request path in plain English.
-  - Include the Mermaid graph exactly as returned in analyzeTrafficFlow.result.mermaid in a \`\`\`mermaid code block.
-  - Render a Markdown table of edges with columns: From, To, Reason.
-  - Do NOT invent nodes/edges; only use returned nodes/edges.
-  - If edges is empty, state: "No traffic edges discovered from available data.".
-POD HEALTH INVESTIGATION EXTENSION:
-- If tool results include investigatePodHealth:
-  - Render a dedicated section titled "Pod Health Investigation".
-  - Start with a 2-3 sentence summary of the likely issue(s) using ONLY the returned diagnosis fields.
-  - Render a table per inspected pod showing: Pod, Phase, Ready, Restarts, Node, Top Reason.
-  - Include a short "Evidence" subsection with:
-    - Recent Events (top 10) as a table (Time, Type, Reason, Message)
-    - Recent Logs (tail) per container (truncate long lines if needed)
-  - Do NOT invent causes. If the tool returned "unknown", say what data is missing.
-SEARCH RESULTS EXTENSION:
-- If tool results include searchResources:
-  - Render a dedicated section titled "Search Results".
-  - Render a Markdown table with columns: Kind, Name, Namespace, apiVersion.
-  - List exactly the items from searchResources.result.results.
-  - If truncated=true, mention that results were truncated and suggest increasing limit or narrowing selectors.
+BASE OUTPUT STRUCTURE
+1) Start with a short 2-3 line summary of the answer.
+2) If a primary resource exists, render an **Identity table**:
+   Columns: Kind | Name | Namespace | apiVersion
+3) Render resource-specific sections using tables when possible.
+4) If referencedResources exist, render a **Referenced Resources** table.
+5) If any tool returned an error, clearly explain the error and what input/permission is missing.
 
-Output format guidelines:
-- Start with a 2-3 line summary.
-- Then show an "Identity" table (kind, name, namespace, apiVersion).
-- Then show resource-specific sections (e.g., for Service -> ports table; for Ingress -> rules table; for Deployment -> pod template, containers, env, volumes tables; for RBAC bindings -> subjects/roleRef tables; for Istio -> routes/destinations/gateways tables).
-- Include a "Referenced resources" table based on referencedResources if available or ignore if empty.
+SECRET / CONFIGMAP HANDLING
+- ConfigMap data/binaryData → always show as tables.
+- Secret dataKeys/stringDataKeys → show keys table.
+- Secret data/stringData → show ONLY if provided and label as **Sensitive**.
+- Never decode base64.
 
-If tool results include an error, explain it and suggest what input is missing or what permission might be required.`;
+SEARCH RESULTS
+If searchResources exists:
+- Render section **Search Results**.
+- Table columns: Kind | Name | Namespace | apiVersion.
+- If truncated=true, mention results were truncated and suggest narrowing filters.
+
+TRAFFIC FLOW
+If analyzeTrafficFlow exists:
+- Section **Traffic Flow**.
+- 2-3 sentence plain English summary.
+- Render Mermaid graph EXACTLY as returned.
+- Table columns: From | To | Reason.
+- If no edges → say no traffic edges discovered.
+
+IMPACT ANALYSIS
+If analyzeImpact exists:
+- Section **Impact Analysis**.
+- Use action field strictly:
+  - action=update → discuss update impact ONLY.
+  - action=delete → discuss deletion impact ONLY.
+- Render impactedResources table:
+  Columns: Kind | Name | Namespace | Impact Type | Severity.
+- If empty → say no resources are impacted.
+
+POD HEALTH
+If investigatePodHealth exists:
+- Section **Pod Health Investigation**.
+- 2-3 sentence summary from diagnosis.
+- Table per pod: Pod | Phase | Ready | Restarts | Node | Top Reason.
+- Evidence subsection:
+  - Recent Events table (Time | Type | Reason | Message)
+  - Recent Logs per container (truncate long lines)
+- If diagnosis unknown → say what data is missing.
+`;
 
   const user = `User request: ${userText}
-
-Tools available: ${toolCatalog.tools.map((t) => t.name).join(", ")}
 
 Tool results (JSON):
 ${JSON.stringify(toolResults, null, 2)}`;
@@ -1182,7 +1203,14 @@ async function kubeConnect(
 
     // quick auth/connectivity check
     const core = kc.makeApiClient(k8s.CoreV1Api);
-    await core.listNamespace();
+    // Add timeout to avoid hanging when cluster is unreachable
+    const TIMEOUT_MS = 5000;
+    await Promise.race([
+      core.listNamespace(),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error(`Kubernetes API timeout after ${TIMEOUT_MS}ms`)), TIMEOUT_MS)
+      )
+    ]);
 
     return {
       kubeConfig: kc,
